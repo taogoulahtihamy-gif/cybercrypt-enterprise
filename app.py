@@ -59,6 +59,13 @@ DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "cybercrypt_enterprise.db"
 PBKDF2_ITERATIONS = 250_000
 
+# Compte initial créé automatiquement au démarrage.
+# En production, changez ces valeurs dans Streamlit Secrets ou variables d'environnement.
+DEFAULT_ADMIN_USERNAME = os.getenv("CYBERCRYPT_ADMIN_USERNAME", "admin")
+DEFAULT_ADMIN_PASSWORD = os.getenv("CYBERCRYPT_ADMIN_PASSWORD", "admin123")
+DEFAULT_ADMIN_FULL_NAME = os.getenv("CYBERCRYPT_ADMIN_FULL_NAME", "Administrator")
+RESET_DEFAULT_ADMIN_PASSWORD = os.getenv("CYBERCRYPT_RESET_DEFAULT_ADMIN", "true").lower() == "true"
+
 
 
 # =====================================================
@@ -112,6 +119,54 @@ def create_user(username: str, full_name: str, password: str, role: str = "analy
     conn.close()
     if audit:
         log_audit("system", "CREATE_USER", "user", f"Utilisateur créé : {username}", "", "SUCCESS")
+
+
+def ensure_admin_account():
+    """
+    Garantit qu'un compte administrateur existe après déploiement.
+    Utile sur Streamlit Cloud, car la base SQLite peut être recréée.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+
+    admin = cur.execute(
+        "SELECT * FROM users WHERE username = ?",
+        (DEFAULT_ADMIN_USERNAME,)
+    ).fetchone()
+
+    if admin is None:
+        salt, pwd_hash = hash_password(DEFAULT_ADMIN_PASSWORD)
+        cur.execute("""
+            INSERT INTO users (username, full_name, role, password_salt, password_hash, is_active, created_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?)
+        """, (
+            DEFAULT_ADMIN_USERNAME,
+            DEFAULT_ADMIN_FULL_NAME,
+            "admin",
+            salt,
+            pwd_hash,
+            now_str()
+        ))
+        conn.commit()
+        conn.close()
+        return
+
+    # Version démo/déploiement : le compte admin reste utilisable après redémarrage cloud.
+    if RESET_DEFAULT_ADMIN_PASSWORD:
+        salt, pwd_hash = hash_password(DEFAULT_ADMIN_PASSWORD)
+        cur.execute("""
+            UPDATE users
+            SET full_name = ?, role = 'admin', password_salt = ?, password_hash = ?, is_active = 1
+            WHERE username = ?
+        """, (
+            DEFAULT_ADMIN_FULL_NAME,
+            salt,
+            pwd_hash,
+            DEFAULT_ADMIN_USERNAME
+        ))
+        conn.commit()
+
+    conn.close()
 
 
 def init_db():
@@ -203,13 +258,10 @@ def init_db():
     )
     """)
 
-    cur.execute("SELECT COUNT(*) AS n FROM users")
-    existing = cur.fetchone()["n"]
     conn.commit()
     conn.close()
 
-    if existing == 0:
-        create_user("admin", "Administrator", "admin123", "admin", audit=False)
+    ensure_admin_account()
 
 
 def authenticate(username: str, password: str):
@@ -1135,22 +1187,19 @@ if not st.session_state.auth:
             key="login_password"
         )
 
+        login_username_clean = login_username.strip()
+        login_password_clean = login_password.strip()
+
         if st.button("Connexion", use_container_width=True):
-            user = authenticate(login_username, login_password)
+            user = authenticate(login_username_clean, login_password_clean)
             if user:
                 st.session_state.auth = True
                 st.session_state.user = user
                 log_audit(user["username"], "LOGIN", "auth", "Connexion utilisateur", "", "SUCCESS")
                 st.rerun()
             else:
-                log_audit(login_username or "unknown", "LOGIN", "auth", "Tentative de connexion échouée", "", "FAILED")
+                log_audit(login_username_clean or "unknown", "LOGIN", "auth", "Tentative de connexion échouée", "", "FAILED")
                 st.error("Identifiant ou mot de passe incorrect.")
-
-        st.markdown("""
-        <div style="font-size:12px;color:#64748B;text-align:center;margin-top:18px;">
-            Compte démo initial : admin / admin123
-        </div>
-        """, unsafe_allow_html=True)
 
     st.stop()
 
@@ -1483,12 +1532,25 @@ with tab_vault:
                 st.error("Titre, secret et clé maître sont obligatoires.")
     with col2:
         st.subheader("Consulter un secret")
-        if st.session_state.vault_items:
-            selected = st.selectbox("Secret", list(range(count_table_for_owner("stored_vault", current_username))), format_func=lambda i: f"{st.session_state.vault_items[i]['title']} — {st.session_state.vault_items[i]['category']}")
-            read_password = st.text_input("Clé maître pour déchiffrer", type="password", key="vault_read_password")
+        persisted_vault_items = fetch_vault_items(current_username)
+
+        if persisted_vault_items:
+            selected = st.selectbox(
+                "Secret",
+                list(range(len(persisted_vault_items))),
+                format_func=lambda i: f"{persisted_vault_items[i]['title']} — {persisted_vault_items[i]['category']}"
+            )
+
+            read_password = st.text_input(
+                "Clé maître pour déchiffrer",
+                type="password",
+                key="vault_read_password"
+            )
+
             if read_password:
-                item = st.session_state.vault_items[selected]
+                item = persisted_vault_items[selected]
                 decrypted = decrypt_vault_item(item["token"], read_password)
+
                 if decrypted:
                     st.success("Secret déchiffré.")
                     st.write(f"Catégorie : {decrypted['category']}")
@@ -1496,7 +1558,13 @@ with tab_vault:
                     copy_button(decrypted["secret"], "📋 Copier le secret")
                 else:
                     st.error("Clé maître incorrecte.")
-            st.download_button("⬇️ Export coffre-fort chiffré", json.dumps(st.session_state.vault_items, ensure_ascii=False, indent=2), file_name="cybercrypt_vault_export.json", mime="application/json")
+
+            st.download_button(
+                "⬇️ Export coffre-fort chiffré",
+                json.dumps(persisted_vault_items, ensure_ascii=False, indent=2),
+                file_name="cybercrypt_vault_export.json",
+                mime="application/json"
+            )
         else:
             st.info("Aucun secret enregistré pour le moment.")
 
